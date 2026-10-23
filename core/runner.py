@@ -1,152 +1,138 @@
-import atexit
-import os
-import subprocess
-import tempfile
-import threading
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+"""Beispiel: nmap im Hintergrund scannen, Ergebnis parsen, GPIO-UI laeuft weiter.
+
+Verdrahtung (BCM-Nummern, anpassbar):
+  Button START  -> GPIO 17 (gegen GND)
+  Button STOP   -> GPIO 22 (gegen GND)
+  LED           -> GPIO 27 (mit Vorwiderstand)
+Ohne gpiozero (z.B. am PC) laeuft ein Tastatur-Fallback: s = Scan, x = Abbruch, q = Ende.
+"""
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+from runner import runner
+
+TARGET = "192.168.1.0/24"
+PIN_START, PIN_STOP, PIN_LED = 17, 22, 27
 
 
-@dataclass
-class Result:
-    ok: bool
-    stdout: str
-    stderr: str
-    code: int  # 0 = Erfolg, >0 = Exit-Code, -1 = eigener Fehler (Timeout, nicht gefunden, ...)
+# ---------- nmap-Ergebnis parsen ----------
+def parse_nmap(xml_text):
+    """XML von `nmap -oX -` -> [{'ip': ..., 'ports': [(port, proto, service), ...]}]"""
+    hosts = []
+    root = ET.fromstring(xml_text)
+    for h in root.findall("host"):
+        status = h.find("status")
+        if status is None or status.get("state") != "up":
+            continue
+        ip = next((a.get("addr") for a in h.findall("address")
+                   if a.get("addrtype") == "ipv4"), "?")
+        ports = []
+        for p in h.findall("ports/port"):
+            if p.find("state").get("state") == "open":
+                svc = p.find("service")
+                ports.append((int(p.get("portid")), p.get("protocol"),
+                              svc.get("name") if svc is not None else "?"))
+        hosts.append({"ip": ip, "ports": ports})
+    return hosts
 
 
-class Runner:
-    def __init__(self, default_timeout=30, max_workers=8):
-        self.default_timeout = default_timeout
-        self._background = {}          # name -> (Popen, logpfad)
-        self._lock = threading.RLock()  # schuetzt _background bei Thread-Zugriff
-        self._pool = ThreadPoolExecutor(max_workers=max_workers)
-        atexit.register(self.shutdown)  # beim Programmende alles aufraeumen
-
-    # ---------- blockierend ----------
-    def run(self, cmd, timeout=None):
-        timeout = timeout or self.default_timeout
+# ---------- Hardware (mit Fallback) ----------
+class Hardware:
+    def __init__(self):
+        self.start_req = False
+        self.stop_req = False
+        self.quit = False
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return Result(p.returncode == 0, p.stdout, p.stderr, p.returncode)
-        except subprocess.TimeoutExpired:
-            return Result(False, "", "Timeout", -1)
-        except FileNotFoundError:
-            return Result(False, "", f"{cmd[0]} nicht gefunden", -1)
-        except OSError as e:  # z.B. PermissionError
-            return Result(False, "", str(e), -1)
+            from gpiozero import Button, LED
+            self.led = LED(PIN_LED)
+            b_start, b_stop = Button(PIN_START), Button(PIN_STOP)
+            b_start.when_pressed = lambda: setattr(self, "start_req", True)
+            b_stop.when_pressed = lambda: setattr(self, "stop_req", True)
+            self._keep = (b_start, b_stop)   # Referenzen halten, sonst werden Buttons freigegeben
+            self.fake = False
+        except Exception:
+            import threading
+            self.led = None
+            self.fake = True
+            print("[Fallback] s = Scan, x = Abbruch, q = Ende (+Enter)")
+            threading.Thread(target=self._keyboard, daemon=True).start()
 
-    def pipe(self, cmd1, cmd2, timeout=None):
-        timeout = timeout or self.default_timeout
-        p1 = p2 = None
-        err1 = tempfile.TemporaryFile()  # verhindert volle Pipe-Puffer bei cmd1
-        try:
-            p1 = subprocess.Popen(cmd1, stdout=subprocess.PIPE, stderr=err1)
-            p2 = subprocess.Popen(cmd2, stdin=p1.stdout, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, text=True)
-            p1.stdout.close()
-            out, err = p2.communicate(timeout=timeout)
-            p1.wait(timeout=5)
-            err1.seek(0)
-            err_all = err1.read().decode(errors="replace") + err
-            return Result(p2.returncode == 0, out, err_all, p2.returncode)
-        except subprocess.TimeoutExpired:
-            return Result(False, "", "Timeout", -1)
-        except FileNotFoundError as e:
-            return Result(False, "", f"{e.filename} nicht gefunden", -1)
-        except OSError as e:
-            return Result(False, "", str(e), -1)
-        finally:
-            for p in (p1, p2):
-                if p and p.poll() is None:
-                    p.kill()
-                    p.wait()
-            err1.close()
+    def _keyboard(self):
+        for line in sys.stdin:
+            c = line.strip().lower()
+            if c == "s":
+                self.start_req = True
+            elif c == "x":
+                self.stop_req = True
+            elif c == "q":
+                self.quit = True
 
-    # ---------- nicht blockierend (Thread) ----------
-    def run_async(self, cmd, timeout=None, callback=None) -> Future:
-        """Fuehrt run() in einem Thread aus. Gibt sofort ein Future zurueck."""
-        fut = self._pool.submit(self.run, cmd, timeout)
-        if callback:
-            fut.add_done_callback(lambda f: callback(f.result()))
-        return fut
+    def led_set(self, on):
+        if self.led:
+            self.led.on() if on else self.led.off()
 
-    def pipe_async(self, cmd1, cmd2, timeout=None, callback=None) -> Future:
-        fut = self._pool.submit(self.pipe, cmd1, cmd2, timeout)
-        if callback:
-            fut.add_done_callback(lambda f: callback(f.result()))
-        return fut
-
-    # ---------- Hintergrundprozesse ----------
-    def start(self, name, cmd) -> Result:
-        """Startet cmd dauerhaft im Hintergrund. stdout+stderr gehen in eine Logdatei."""
-        with self._lock:
-            if self.is_running(name):
-                return Result(False, "", f"'{name}' laeuft bereits", -1)
-            fd, path = tempfile.mkstemp(prefix=f"runner_{name}_", suffix=".log")
-            try:
-                with os.fdopen(fd, "wb") as log:
-                    p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
-            except FileNotFoundError:
-                os.remove(path)
-                return Result(False, "", f"{cmd[0]} nicht gefunden", -1)
-            except OSError as e:
-                os.remove(path)
-                return Result(False, "", str(e), -1)
-            self._background[name] = (p, path)
-            return Result(True, "", "", 0)
-
-    def is_running(self, name) -> bool:
-        with self._lock:
-            entry = self._background.get(name)
-            return entry is not None and entry[0].poll() is None
-
-    def exit_code(self, name):
-        """None = laeuft noch (oder unbekannt), sonst der Exit-Code."""
-        with self._lock:
-            entry = self._background.get(name)
-            return entry[0].poll() if entry else None
-
-    def read_output(self, name) -> str:
-        """Bisherige Ausgabe (stdout+stderr) des Hintergrundprozesses."""
-        with self._lock:
-            entry = self._background.get(name)
-        if not entry:
-            return ""
-        with open(entry[1], "r", errors="replace") as f:
-            return f.read()
-
-    def stop(self, name) -> str:
-        """Beendet den Prozess, raeumt auf, gibt die letzte Ausgabe zurueck."""
-        with self._lock:
-            entry = self._background.pop(name, None)
-        if not entry:
-            return ""
-        p, path = entry
-        if p.poll() is None:
-            p.terminate()
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                p.wait()
-        try:
-            with open(path, "r", errors="replace") as f:
-                out = f.read()
-            os.remove(path)
-        except OSError:
-            out = ""
-        return out
-
-    def stop_all(self):
-        with self._lock:
-            names = list(self._background)
-        for n in names:
-            self.stop(n)
-
-    def shutdown(self):
-        self.stop_all()
-        self._pool.shutdown(wait=False, cancel_futures=True)
+    def take(self, attr):
+        """Flag lesen und zuruecksetzen (einmaliges Ereignis)."""
+        v = getattr(self, attr)
+        setattr(self, attr, False)
+        return v
 
 
-runner = Runner()
+def main():
+    hw = Hardware()
+    scanning = False
+    last_blink = 0.0
+    led_on = False
+
+    print("Bereit. Button START druecken.")
+    while not hw.quit:                             # <- UI-Loop, wird NIE blockiert
+        # 1) Eingaben
+        if hw.take("start_req") and not scanning:
+            runner.run_async(
+                ["nmap", "-F", "-oX", "-", TARGET], tag="scan", timeout=300)
+            scanning = True
+            print("Scan gestartet ...")
+
+        if hw.take("stop_req") and scanning:
+            # Future.cancel() wirkt nicht mehr, wenn der Job laeuft -> hier simpel:
+            # Ergebnis wird beim Eintreffen verworfen.
+            print("Abbruch angefordert (Ergebnis wird verworfen)")
+            scanning = "cancelled"
+
+        # 2) Fertige Ergebnisse abholen (nicht blockierend)
+        for tag, r in runner.poll_results():
+            if tag == "scan":
+                if scanning == "cancelled":
+                    print("Scan verworfen.")
+                elif not r.ok:
+                    print(f"Scan fehlgeschlagen ({r.code}): {r.stderr.strip()}")
+                else:
+                    try:
+                        hosts = parse_nmap(r.stdout)
+                    except ET.ParseError:
+                        print("nmap-Ausgabe nicht lesbar")
+                        hosts = []
+                    print(f"{len(hosts)} Host(s) gefunden:")
+                    for h in hosts:
+                        ports = ", ".join(f"{p}/{pr} ({s})" for p, pr, s in h["ports"]) or "-"
+                        print(f"  {h['ip']}: {ports}")
+                scanning = False
+                hw.led_set(False)
+
+        # 3) LED blinkt waehrend des Scans
+        if scanning and time.time() - last_blink > 0.3:
+            led_on = not led_on
+            hw.led_set(led_on)
+            last_blink = time.time()
+
+        time.sleep(0.02)
+
+    runner.shutdown()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        runner.shutdown()
