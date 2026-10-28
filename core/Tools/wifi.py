@@ -7,7 +7,7 @@ CORE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if CORE_DIR not in sys.path:
     sys.path.insert(0, CORE_DIR)
 
-from runner import run, ReturnStatus
+from runner import run, ReturnStatus,run_sudo
 
 #nmcli -t -f SSID,SIGNAL device wifi list
 def search_wifis():
@@ -25,23 +25,16 @@ def search_wifis():
                 verfügbare_wifis.append(lines)
         return verfügbare_wifis
 #verbinden
-def connectWifi(ssid: str,passwort:str):
-    status,output = run(["nmcli","dev","wifi","connect",ssid,"password",passwort])
-    if status == ReturnStatus.OK:
-        return True,output
-    elif status == ReturnStatus.ERROR:
-        return False,output
+def connectWifi(ssid: str, passwort: str):
+    # altes Profil löschen
+    run_sudo(["nmcli", "connection", "delete", ssid], "theo4801")
 
-wifis = search_wifis()
-if wifis != None:
-    print(wifis)
-    index = 0
-    for i in range(0,len(wifis)):
-        if wifis[i] == "Theo":
-            index = i
-    print(index)
-    connectStatus,output = connectWifi(wifis[index],"Torsten1") 
-    if connectStatus == False:
-        print(output)
+    status, output = run_sudo(
+        ["nmcli", "dev", "wifi", "connect", ssid, "password", passwort],
+        "theo4801"
+    )
+
+    if status == ReturnStatus.OK:
+        return True, output
     else:
-        print("verbunden")
+        return False, output
