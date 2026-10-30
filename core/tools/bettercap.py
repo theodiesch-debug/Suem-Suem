@@ -12,7 +12,7 @@ def zeige_wlan_nutzer():
     bettercap_api.starte("wlan0")
     time.sleep(5)
     nutzer = bettercap_api.hole_geraete()
-    print(nutzer)  # <- jetzt eingerückt, innerhalb der Funktion
+    print(nutzer)  
 def stopp_bettercap():
     bettercap_api.stoppe()
 
